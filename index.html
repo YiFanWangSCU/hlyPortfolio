@@ -43,6 +43,7 @@
       }
 
       .page {
+        position: relative;
         overflow: hidden;
         margin: 0 auto 20px;
         background: #fff;
@@ -53,6 +54,16 @@
         display: block;
         width: 100%;
         height: auto;
+      }
+
+      .page-placeholder {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: #f5f5f5;
+        color: #737373;
+        font-size: 0.875rem;
       }
 
       .error {
@@ -106,45 +117,122 @@
       const pages = document.getElementById("pages");
       const status = document.getElementById("status");
       const error = document.getElementById("error");
+      const renderedPages = new Set();
+      const renderingPages = new Set();
+      const queuedPages = new Set();
+      let loadedPageCount = 0;
+      let processingQueue = false;
+      let pdf;
+      let pageWidth;
+      let pageHeight;
 
       pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
         "./vendor/pdfjs/pdf.worker.min.mjs",
         import.meta.url
       ).href;
 
+      function updateStatus() {
+        status.textContent = `已加载 ${loadedPageCount} / ${pdf.numPages} 页`;
+      }
+
+      async function renderPage(number) {
+        if (renderedPages.has(number) || renderingPages.has(number)) return;
+        renderingPages.add(number);
+        const pageElement = pages.children[number - 1];
+
+        try {
+          const page = await pdf.getPage(number);
+          const availableWidth = Math.min(pages.clientWidth, 1440);
+          const viewport = page.getViewport({ scale: availableWidth / pageWidth });
+          const pixelRatio = window.devicePixelRatio || 1;
+          const canvas = document.createElement("canvas");
+          const context = canvas.getContext("2d", { alpha: false });
+
+          canvas.width = Math.floor(viewport.width * pixelRatio);
+          canvas.height = Math.floor(viewport.height * pixelRatio);
+          await page.render({
+            canvasContext: context,
+            transform: [pixelRatio, 0, 0, pixelRatio, 0, 0],
+            viewport,
+          }).promise;
+
+          pageElement.replaceChildren(canvas);
+          pageElement.removeAttribute("aria-busy");
+          renderedPages.add(number);
+          loadedPageCount += 1;
+          updateStatus();
+        } catch (exception) {
+          pageElement.textContent = `第 ${number} 页加载失败`;
+          console.error(`Unable to render portfolio page ${number}`, exception);
+        } finally {
+          renderingPages.delete(number);
+        }
+      }
+
+      async function processRenderQueue() {
+        if (processingQueue) return;
+        processingQueue = true;
+
+        while (queuedPages.size > 0) {
+          const [nextPage] = [...queuedPages].sort((first, second) => {
+            const firstDistance = Math.abs(pages.children[first - 1].getBoundingClientRect().top);
+            const secondDistance = Math.abs(pages.children[second - 1].getBoundingClientRect().top);
+            return firstDistance - secondDistance;
+          });
+          queuedPages.delete(nextPage);
+          await renderPage(nextPage);
+        }
+
+        processingQueue = false;
+      }
+
+      function queuePage(number) {
+        if (renderedPages.has(number) || renderingPages.has(number) || queuedPages.has(number)) return;
+        queuedPages.add(number);
+        void processRenderQueue();
+      }
+
       async function renderPortfolio() {
         try {
-          const pdf = await pdfjsLib.getDocument(pdfUrl).promise;
-          const pixelRatio = window.devicePixelRatio || 1;
+          pdf = await pdfjsLib.getDocument({
+            url: pdfUrl,
+            rangeChunkSize: 256 * 1024,
+            disableAutoFetch: true,
+            disableStream: true,
+          }).promise;
+
+          const firstPage = await pdf.getPage(1);
+          const firstViewport = firstPage.getViewport({ scale: 1 });
+          pageWidth = firstViewport.width;
+          pageHeight = firstViewport.height;
 
           for (let number = 1; number <= pdf.numPages; number += 1) {
-            status.textContent = `正在加载第 ${number} / ${pdf.numPages} 页`;
-            const page = await pdf.getPage(number);
-            const originalViewport = page.getViewport({ scale: 1 });
-            const availableWidth = Math.min(pages.clientWidth, 1440);
-            const viewport = page.getViewport({ scale: availableWidth / originalViewport.width });
-            const canvas = document.createElement("canvas");
-            const context = canvas.getContext("2d", { alpha: false });
-
-            canvas.width = Math.floor(viewport.width * pixelRatio);
-            canvas.height = Math.floor(viewport.height * pixelRatio);
             const pageElement = document.createElement("section");
             pageElement.className = "page";
+            pageElement.dataset.page = number;
+            pageElement.style.aspectRatio = `${pageWidth} / ${pageHeight}`;
             pageElement.setAttribute("aria-label", `作品集第 ${number} 页`);
-            pageElement.append(canvas);
+            pageElement.setAttribute("aria-busy", "true");
+            pageElement.innerHTML = `<div class="page-placeholder">第 ${number} 页</div>`;
             pages.append(pageElement);
-
-            await page.render({
-              canvasContext: context,
-              transform: [pixelRatio, 0, 0, pixelRatio, 0, 0],
-              viewport,
-            }).promise;
           }
 
+          await renderPage(1);
+
+          const observer = new IntersectionObserver((entries) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting) continue;
+              observer.unobserve(entry.target);
+              queuePage(Number(entry.target.dataset.page));
+            }
+          }, { rootMargin: "200px 0px" });
+
+          for (const pageElement of pages.children) {
+            if (pageElement.dataset.page !== "1") observer.observe(pageElement);
+          }
           pages.setAttribute("aria-busy", "false");
-          status.textContent = `共 ${pdf.numPages} 页`;
         } catch (exception) {
-          console.error("Unable to render portfolio PDF", exception);
+          console.error("Unable to load portfolio PDF", exception);
           pages.setAttribute("aria-busy", "false");
           status.textContent = "加载失败";
           error.hidden = false;
