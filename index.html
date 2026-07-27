@@ -72,11 +72,21 @@
     <script>
       const pdfUrl = "./portfolio.pdf";
       const loading = document.getElementById("loading");
+      const useNativePdfViewer = window.matchMedia(
+        "(max-width: 768px), (pointer: coarse)"
+      ).matches;
 
       async function showPortfolio() {
         try {
           const response = await fetch(pdfUrl, { method: "HEAD", cache: "no-store" });
           if (!response.ok) throw new Error("PDF not found");
+
+          // Mobile browsers do not reliably support a scrollable PDF in an iframe.
+          // Open the file itself so the browser's native PDF reader can show every page.
+          if (useNativePdfViewer) {
+            window.location.replace(pdfUrl);
+            return;
+          }
 
           const viewer = document.createElement("iframe");
           viewer.className = "viewer";
